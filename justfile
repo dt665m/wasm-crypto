@@ -1,5 +1,6 @@
 #set dotenv-load
 alias b := build 
+alias ti := test-integ
 
 # Path and Variables
 ORG := "dt665m"
@@ -36,6 +37,12 @@ build:
     RUSTFLAGS="-C target-feature=+multivalue" cargo wasi build --release
     cp ./target/wasm32-wasi/release/wasm_crypto.wasi.wasm ./host-wrappers/rust/src
     cp ./target/wasm32-wasi/release/wasm_crypto.wasi.wasm ./host-wrappers/go
+
+tag:
+	git tag -a v{{SEM_VER}} -m "v{{SEM_VER}}"
+
+untag:
+	git tag -d v{{SEM_VER}}
 
 ###########################################################
 ### Testing 
