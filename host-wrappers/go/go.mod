@@ -1,4 +1,4 @@
-module github.com/dt665m/wasm-crypto/host-wrappers/go 
+module github.com/dt665m/wasm-crypto/host-wrappers/go
 
 go 1.18
 
