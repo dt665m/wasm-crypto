@@ -23,7 +23,7 @@ func TestWasmSigner(t *testing.T) {
 	message := make([]byte, 32)
 	secretKey, err := hex.DecodeString("71ccdc13ab4775fc012763de2dfafa68bee9169cc27f06ab9107630d7c8f2992")
 	check(err)
-	output, err := signer.signRecoverable(secretKey, message)
+	output, err := signer.SignRecoverable(secretKey, message)
 	check(err)
 
 	elapsed := time.Since(start)

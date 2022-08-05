@@ -2,3 +2,5 @@ github.com/bytecodealliance/wasmtime-go v0.39.0 h1:35AXy5+py5ZXRSpfoxqh+dWJ7nJnI
 github.com/bytecodealliance/wasmtime-go v0.39.0/go.mod h1:q320gUxqyI8yB+ZqRuaJOEnGkAnHh6WtJjMaT2CW4wI=
 github.com/dt665m/wasm-crypto/host-wrappers/go v0.0.0-20220805093608-71a870c270f6 h1:mqZaBJJFkcoxxrkwh2T5kCWX0ECz9gxFP6re9wQPOek=
 github.com/dt665m/wasm-crypto/host-wrappers/go v0.0.0-20220805093608-71a870c270f6/go.mod h1:u1kC8vnUzMmkfU+Vj4XMdeQ1krklu7X7I//y4X6XGsw=
+github.com/dt665m/wasm-crypto/host-wrappers/go v0.0.0-20220805093823-8abb12e93dcf h1:TYq1lFaUwrht4tbq3s2RRGADHpSC8TrHwjPOxF0MjS4=
+github.com/dt665m/wasm-crypto/host-wrappers/go v0.0.0-20220805093823-8abb12e93dcf/go.mod h1:u1kC8vnUzMmkfU+Vj4XMdeQ1krklu7X7I//y4X6XGsw=
