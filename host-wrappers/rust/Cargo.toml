@@ -1,0 +1,13 @@
+[package]
+name = "wasm-signer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+wasmtime = "0.39.1"
+wasmtime-wasi = "0.39.1"
+
+##Sanity Testing
+#k256 = { version = "0.11", default-features = false, features = ["keccak256", "ecdsa", "std"] }
+#sha2 = { version = "0.10.2", default-features = false }
