@@ -51,7 +51,7 @@ func NewWasmSigner() (*WasmSigner, error) {
 	}, nil
 }
 
-func (c *WasmSigner) signRecoverable(secretKey, message []byte) ([]byte, error) {
+func (c *WasmSigner) SignRecoverable(secretKey, message []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -103,7 +103,7 @@ func (c *WasmSigner) signRecoverable(secretKey, message []byte) ([]byte, error) 
 	return output, nil
 }
 
-func (c *WasmSigner) signKeccak256Recoverable(secretKey, message []byte) ([]byte, error) {
+func (c *WasmSigner) SignKeccak256Recoverable(secretKey, message []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -155,7 +155,7 @@ func (c *WasmSigner) signKeccak256Recoverable(secretKey, message []byte) ([]byte
 	return output, nil
 }
 
-func (c *WasmSigner) signToDer(secretKey, message []byte) ([]byte, error) {
+func (c *WasmSigner) SignToDer(secretKey, message []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
