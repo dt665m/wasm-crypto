@@ -1,10 +1,7 @@
 package WasmSigner 
 
 import (
-	"encoding/hex"
-	"fmt"
 	"sync"
-	"time"
 	_ "embed"
 
 	"github.com/bytecodealliance/wasmtime-go"

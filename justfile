@@ -21,6 +21,7 @@ deps: deps-rust
 
 deps-rust:
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
 deps-wasm:
     curl https://wasmtime.dev/install.sh -sSf | bash
     cargo install cargo-wasi
@@ -38,6 +39,13 @@ build:
 
 ###########################################################
 ### Testing 
+
+test-integ: build
+    #!/usr/bin/env bash
+    set -euxo pipefail
+    cargo test --test integration -- --nocapture
+    pushd tests/integration-go
+    go test
 
 test NAME="":
     cargo test '{{NAME}}' -- --nocapture
