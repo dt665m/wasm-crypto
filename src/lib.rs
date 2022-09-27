@@ -1,9 +1,19 @@
 //! Secp256k1 signatures exposed as C FFI for WASM or any other C FFI bindings
+mod output;
+use output::*;
 
-use k256::ecdsa::{
-    recoverable::Signature as RecoverableSignature,
-    signature::{DigestSigner, Signer},
-    Signature, SigningKey,
+use coins_bip32::{
+    enc::{MainnetEncoder, XKeyEncoder},
+    xkeys::Parent,
+};
+
+use k256::{
+    ecdsa::{
+        recoverable::Signature as RecoverableSignature,
+        signature::{DigestSigner, Signer},
+        Signature, SigningKey,
+    },
+    elliptic_curve::sec1::ToEncodedPoint,
 };
 use std::alloc::{alloc, dealloc, Layout};
 
@@ -21,20 +31,24 @@ pub unsafe fn m_free(ptr: *mut u8, size: usize) {
     dealloc(ptr, layout);
 }
 
-/// Secp256k1 recoverable signature.  Assumes payload is pre-hashed
+/// Secp256k1 signature.  Assumes payload is pre-hashed.
+/// Recoverable signature is encoded in ASN.1 DER
 #[no_mangle]
-pub unsafe fn sign_secp256k1_recoverable(
+pub unsafe fn sign_secp256k1(
     pk_ptr: *mut u8,
     pk_len: usize,
     msg_ptr: *mut u8,
     msg_len: usize,
-) -> (*mut u8, usize) {
-    let (signing_key, message) = parse_input(pk_ptr, pk_len, msg_ptr, msg_len);
-    let sig = DigestSigner::<hash::Sha256Proxy, RecoverableSignature>::sign_digest(
+    recoverable: usize,
+) -> *const RawVec {
+    let (key_bytes, msg_bytes) = parse_input(pk_ptr, pk_len, msg_ptr, msg_len);
+    let signing_key =
+        SigningKey::from_bytes(key_bytes.as_slice()).expect("key should be valid. qed");
+    to_raw(secp256k1_sign_inner(
         &signing_key,
-        hash::Sha256Proxy::from(message.as_slice()),
-    );
-    to_output(sig.as_ref().to_vec())
+        &msg_bytes,
+        if recoverable != 0 { true } else { false },
+    ))
 }
 
 /// Secp256k1 recoverable signature.  Hashing is done on the message using
@@ -45,64 +59,137 @@ pub unsafe fn sign_keccak256_secp256k1_recoverable(
     pk_len: usize,
     msg_ptr: *mut u8,
     msg_len: usize,
-) -> (*mut u8, usize) {
-    let (signing_key, message) = parse_input(pk_ptr, pk_len, msg_ptr, msg_len);
-    let sig: RecoverableSignature = signing_key.sign(message.as_slice());
-    to_output(sig.as_ref().to_vec())
+) -> *const RawVec {
+    let (key_bytes, msg_bytes) = parse_input(pk_ptr, pk_len, msg_ptr, msg_len);
+    let signing_key =
+        SigningKey::from_bytes(key_bytes.as_slice()).expect("key should be valid. qed");
+    let sig: RecoverableSignature = signing_key.sign(msg_bytes.as_slice());
+    to_raw(sig.as_ref().to_vec())
 }
 
-/// Secp256k1 signature encoded in ASN.1 DER.  Assumes payload is pre-hashed
+/// XPriv Sign
 #[no_mangle]
-pub unsafe fn sign_secp256k1_to_der(
+pub fn xpriv_sign_secp256k1(
     pk_ptr: *mut u8,
     pk_len: usize,
     msg_ptr: *mut u8,
     msg_len: usize,
-) -> (*mut u8, usize) {
-    let (signing_key, message) = parse_input(pk_ptr, pk_len, msg_ptr, msg_len);
-    let sig = DigestSigner::<hash::Sha256Proxy, Signature>::sign_digest(
-        &signing_key,
-        hash::Sha256Proxy::from(message.as_slice()),
-    );
-    to_output(sig.to_der().as_ref().to_vec())
+    recoverable: usize,
+) -> *const RawVec {
+    let (xpriv_bytes, msg_bytes) = unsafe { parse_input(pk_ptr, pk_len, msg_ptr, msg_len) };
+    let xpriv = unsafe {
+        MainnetEncoder::xpriv_from_base58(std::str::from_utf8_unchecked(&xpriv_bytes))
+            .expect("decoding should succeed")
+    };
+
+    to_raw(secp256k1_sign_inner(
+        xpriv.as_ref(),
+        &msg_bytes,
+        if recoverable != 0 { true } else { false },
+    ))
 }
 
+/// XPriv Sign with Derivation Child Index
+#[no_mangle]
+pub fn xpriv_child_sign_secp256k1(
+    pk_ptr: *mut u8,
+    pk_len: usize,
+    msg_ptr: *mut u8,
+    msg_len: usize,
+    recoverable: usize,
+    child_index: usize,
+) -> *const RawVec {
+    let (xpriv_bytes, msg_bytes) = unsafe { parse_input(pk_ptr, pk_len, msg_ptr, msg_len) };
+    let xpriv = unsafe {
+        MainnetEncoder::xpriv_from_base58(std::str::from_utf8_unchecked(&xpriv_bytes))
+            .expect("decoding should succeed")
+    };
+    let xpriv = xpriv
+        .derive_child(child_index as u32)
+        .expect("child_index should be valid");
+
+    to_raw(secp256k1_sign_inner(
+        xpriv.as_ref(),
+        &msg_bytes,
+        if recoverable != 0 { true } else { false },
+    ))
+}
+
+/// Secp256k1 public key bytes from SecretKey
+#[no_mangle]
+pub unsafe fn public_key_from_secret(
+    pk_ptr: *mut u8,
+    pk_len: usize,
+    compressed: usize,
+) -> *const RawVec {
+    let signing_key =
+        SigningKey::from_bytes(Vec::from_raw_parts(pk_ptr, pk_len, pk_len).as_slice())
+            .expect("key should be valid. qed");
+    let verifying_key = signing_key.verifying_key();
+    let verifying_key = verifying_key.to_encoded_point(compressed > 0);
+    to_raw(verifying_key.as_bytes().to_vec())
+}
+
+/// Recoverable = Ethereum Style Signature
+/// !Recoverable = Bitcoin Style Signature (`der` encoded)
+#[inline]
+fn secp256k1_sign_inner(signing_key: &SigningKey, message: &[u8], recoverable: bool) -> Vec<u8> {
+    if recoverable {
+        DigestSigner::<hash::Sha256Proxy, RecoverableSignature>::sign_digest(
+            signing_key,
+            hash::Sha256Proxy::from(message),
+        )
+        .as_ref()
+        .to_vec()
+    } else {
+        DigestSigner::<hash::Sha256Proxy, Signature>::sign_digest(
+            signing_key,
+            hash::Sha256Proxy::from(message),
+        )
+        .to_der()
+        .as_ref()
+        .to_vec()
+    }
+}
+
+/// By default we usually have a key input and msg input
 #[inline]
 unsafe fn parse_input(
     pk_ptr: *mut u8,
     pk_len: usize,
     msg_ptr: *mut u8,
     msg_len: usize,
-) -> (SigningKey, Vec<u8>) {
+) -> (Vec<u8>, Vec<u8>) {
     (
-        SigningKey::from_bytes(Vec::from_raw_parts(pk_ptr, pk_len, pk_len).as_slice())
-            .expect("key should be valid. qed"),
+        Vec::from_raw_parts(pk_ptr, pk_len, pk_len),
         Vec::from_raw_parts(msg_ptr, msg_len, msg_len),
     )
 }
 
+/// We use C memory layout "serialization" to respond back to the host
 #[inline]
-fn to_output(mut sig_bytes: Vec<u8>) -> (*mut u8, usize) {
-    let ret_len = sig_bytes.len();
-    let ptr = sig_bytes.as_mut_ptr();
+fn to_raw(mut data: Vec<u8>) -> *const RawVec {
+    let ret_len = data.len();
+    let ptr = data.as_mut_ptr();
+
+    // need to force a heap allocation to write into the linear wasm memory
+    let result = Box::new(RawVec {
+        ptr: ptr as i32,
+        len: ret_len as i32,
+    });
+    // leak the box into a `ptr`
+    let ret = Box::into_raw(result) as *const RawVec;
+
     // leak pointer so memory isn't dropped when out of scope
     // `ptr` must be freed by the host caller
-    std::mem::forget(sig_bytes);
-    (ptr, ret_len)
-}
-
-pub fn respond_error(err_message: String) -> (*mut u8, usize) {
-    let mut err_msg = err_message.to_string().into_bytes();
-    let ptr = err_msg.as_mut_ptr();
-    let err_msg_len = err_msg.len();
-    std::mem::forget(err_msg);
-    (ptr, err_msg_len)
+    std::mem::forget(data);
+    ret
 }
 
 mod hash {
     //! This is a helper module used to pass the pre-hashed message for signing to the
     //! `sign_digest` methods of K256.
-    use k256::ecdsa::signature::digest::{
+    use coins_bip32::prelude::k256::ecdsa::signature::digest::{
         generic_array::GenericArray, Digest, FixedOutput, FixedOutputReset, HashMarker, Output,
         OutputSizeUser, Reset, Update,
     };

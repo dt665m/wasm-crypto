@@ -1,12 +1,13 @@
 [package]
-name = "wasm-signer"
+name = "wasm-crypto-rs"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+serde = "1"
 anyhow = "1"
-wasmtime = "0.39.1"
-wasmtime-wasi = "0.39.1"
+wasmtime = "1"
+wasmtime-wasi = "1"
 
 ##Sanity Testing
 #k256 = { version = "0.11", default-features = false, features = ["keccak256", "ecdsa", "std"] }

@@ -1,6 +1,6 @@
 #set dotenv-load
 alias b := build 
-alias ti := test-integ
+alias it := integration-test 
 
 # Path and Variables
 ORG := "dt665m"
@@ -25,6 +25,7 @@ deps-rust:
 
 deps-wasm:
     curl https://wasmtime.dev/install.sh -sSf | bash
+    rustup target add wasm32-wasi
     cargo install cargo-wasi
 
 ###########################################################
@@ -34,7 +35,8 @@ deps-wasm:
 build:
     #!/usr/bin/env bash
     set -euxo pipefail
-    RUSTFLAGS="-C target-feature=+multivalue" cargo wasi build --release
+    cargo wasi build --release
+    #RUSTFLAGS="-C target-feature=+multivalue" cargo wasi build --release
     cp ./target/wasm32-wasi/release/wasm_crypto.wasi.wasm ./host-wrappers/rust/src
     cp ./target/wasm32-wasi/release/wasm_crypto.wasi.wasm ./host-wrappers/go
 
@@ -47,10 +49,10 @@ untag:
 ###########################################################
 ### Testing 
 
-test-integ: build
+integration-test: build
     #!/usr/bin/env bash
-    set -euxo pipefail
-    cargo test --test integration -- --nocapture
+    #set -euxo pipefail
+    #RUST_BACKTRACE=1 cargo test --release --test integration -- --nocapture
     pushd tests/integration-go
     go test
 
