@@ -117,14 +117,25 @@ pub fn xpriv_child_sign_secp256k1(
 
 /// Secp256k1 public key bytes from SecretKey
 #[no_mangle]
-pub unsafe fn public_key_from_secret(
-    pk_ptr: *mut u8,
-    pk_len: usize,
-    compressed: usize,
-) -> *const RawVec {
-    let signing_key =
+pub fn public_key_from_secret(pk_ptr: *mut u8, pk_len: usize, compressed: usize) -> *const RawVec {
+    let signing_key = unsafe {
         SigningKey::from_bytes(Vec::from_raw_parts(pk_ptr, pk_len, pk_len).as_slice())
-            .expect("key should be valid. qed");
+            .expect("key should be valid. qed")
+    };
+    let verifying_key = signing_key.verifying_key();
+    let verifying_key = verifying_key.to_encoded_point(compressed > 0);
+    to_raw(verifying_key.as_bytes().to_vec())
+}
+
+/// Secp256k1 public key bytes from XPriv
+#[no_mangle]
+pub fn public_key_from_xpriv(pk_ptr: *mut u8, pk_len: usize, compressed: usize) -> *const RawVec {
+    let xpriv = unsafe {
+        let xpriv_bytes = Vec::from_raw_parts(pk_ptr, pk_len, pk_len);
+        MainnetEncoder::xpriv_from_base58(std::str::from_utf8_unchecked(&xpriv_bytes))
+            .expect("decoding should succeed")
+    };
+    let signing_key: &SigningKey = xpriv.as_ref();
     let verifying_key = signing_key.verifying_key();
     let verifying_key = verifying_key.to_encoded_point(compressed > 0);
     to_raw(verifying_key.as_bytes().to_vec())

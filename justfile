@@ -52,7 +52,7 @@ untag:
 integration-test: build
     #!/usr/bin/env bash
     #set -euxo pipefail
-    #RUST_BACKTRACE=1 cargo test --release --test integration -- --nocapture
+    RUST_BACKTRACE=1 cargo test --release --test integration -- --nocapture
     pushd tests/integration-go
     go test
 

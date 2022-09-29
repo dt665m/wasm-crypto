@@ -249,6 +249,49 @@ func (c *WasmCrypto) PublicKey(secretKey []byte, compressed bool) ([]byte, error
 	return res, nil
 }
 
+func (c *WasmCrypto) PublicKeyXPriv(xpriv []byte, compressed bool) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	memory := c.instance.GetExport(c.store, "memory").Memory()
+	mAlloc := c.instance.GetExport(c.store, "m_alloc").Func()
+	mFree := c.instance.GetExport(c.store, "m_free").Func()
+	publicKey := c.instance.GetExport(c.store, "public_key_from_xpriv").Func()
+
+	secretKeyLen := int32(len(xpriv))
+
+	// Allocate
+	keyAlloc, err := mAlloc.Call(c.store, secretKeyLen)
+	if err != nil {
+		return nil, err
+	}
+	keyPtr, _ := keyAlloc.(int32)
+
+	buf := memory.UnsafeData(c.store)
+	copy(buf[keyPtr:keyPtr+secretKeyLen], xpriv)
+	comp := 0
+	if compressed {
+		comp = 1
+	}
+	callResult, err := publicKey.Call(c.store, keyPtr, secretKeyLen, comp)
+	if err != nil {
+		return nil, err
+	}
+
+	retPtr := callResult.(int32)
+	res, err := extract_result(c.store, buf, mFree, retPtr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Free
+	if _, err = mFree.Call(c.store, keyPtr, secretKeyLen); err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
 // #HACK we know the C Repr of the Rust `RawVec` return value so we will hack this instead
 // of messing with C.GO
 // RAW [144, 66, 16, 0, 65, 0, 0, 0]
