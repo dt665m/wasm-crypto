@@ -131,7 +131,7 @@ func (c *WasmCrypto) XPrivSignSecp256k1(xpriv, message []byte, recoverable bool)
 	if recoverable {
 		rec = 1
 	}
-    callResult, err := fn.Call(c.store, keyPtr, secretKeyLen, msgPtr, messageLen, rec)
+	callResult, err := fn.Call(c.store, keyPtr, secretKeyLen, msgPtr, messageLen, rec)
 	if err != nil {
 		return nil, err
 	}
@@ -274,6 +274,49 @@ func (c *WasmCrypto) PublicKeyXPriv(xpriv []byte, compressed bool) ([]byte, erro
 		comp = 1
 	}
 	callResult, err := publicKey.Call(c.store, keyPtr, secretKeyLen, comp)
+	if err != nil {
+		return nil, err
+	}
+
+	retPtr := callResult.(int32)
+	res, err := extract_result(c.store, buf, mFree, retPtr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Free
+	if _, err = mFree.Call(c.store, keyPtr, secretKeyLen); err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
+func (c *WasmCrypto) PublicKeyXPrivChild(xpriv []byte, compressed bool, childIndex int32) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	memory := c.instance.GetExport(c.store, "memory").Memory()
+	mAlloc := c.instance.GetExport(c.store, "m_alloc").Func()
+	mFree := c.instance.GetExport(c.store, "m_free").Func()
+	publicKey := c.instance.GetExport(c.store, "public_key_from_xpriv_child").Func()
+
+	secretKeyLen := int32(len(xpriv))
+
+	// Allocate
+	keyAlloc, err := mAlloc.Call(c.store, secretKeyLen)
+	if err != nil {
+		return nil, err
+	}
+	keyPtr, _ := keyAlloc.(int32)
+
+	buf := memory.UnsafeData(c.store)
+	copy(buf[keyPtr:keyPtr+secretKeyLen], xpriv)
+	comp := 0
+	if compressed {
+		comp = 1
+	}
+	callResult, err := publicKey.Call(c.store, keyPtr, secretKeyLen, comp, childIndex)
 	if err != nil {
 		return nil, err
 	}

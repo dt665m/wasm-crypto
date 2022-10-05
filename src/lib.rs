@@ -141,6 +141,27 @@ pub fn public_key_from_xpriv(pk_ptr: *mut u8, pk_len: usize, compressed: usize) 
     to_raw(verifying_key.as_bytes().to_vec())
 }
 
+/// Secp256k1 public key bytes from XPriv Child
+#[no_mangle]
+pub fn public_key_from_xpriv_child(
+    pk_ptr: *mut u8,
+    pk_len: usize,
+    compressed: usize,
+    child_index: usize,
+) -> *const RawVec {
+    let xpriv = unsafe {
+        let xpriv_bytes = Vec::from_raw_parts(pk_ptr, pk_len, pk_len);
+        MainnetEncoder::xpriv_from_base58(std::str::from_utf8_unchecked(&xpriv_bytes))
+            .expect("decoding should succeed")
+    }
+    .derive_child(child_index as u32)
+    .unwrap();
+    let signing_key: &SigningKey = xpriv.as_ref();
+    let verifying_key = signing_key.verifying_key();
+    let verifying_key = verifying_key.to_encoded_point(compressed > 0);
+    to_raw(verifying_key.as_bytes().to_vec())
+}
+
 /// Recoverable = Ethereum Style Signature
 /// !Recoverable = Bitcoin Style Signature (`der` encoded)
 #[inline]

@@ -181,7 +181,7 @@ impl WasmCrypto {
         secret_key: &[u8],
         message: &[u8],
         recoverable: bool,
-        child_index: usize,
+        child_index: i32,
     ) -> anyhow::Result<Vec<u8>> {
         let mut store = &mut self.store;
         let instance = &self.instance;
@@ -212,7 +212,7 @@ impl WasmCrypto {
                 msg_ptr,
                 msg_len,
                 if recoverable { 1 } else { 0 },
-                child_index as i32,
+                child_index,
             ),
         )?;
         // extracted results free itself
@@ -275,6 +275,48 @@ impl WasmCrypto {
         let ret_ptr = func.call(
             &mut store,
             (secret_ptr, secret_len, if compressed { 1 } else { 0 }),
+        )?;
+        // extracted results free itself
+        let res = extract_result(store, &memory, &m_free, ret_ptr)?;
+
+        // input can be freed
+        m_free.call(&mut store, (secret_ptr, secret_len))?;
+
+        Ok(res)
+    }
+
+    pub fn public_key_xpriv_child(
+        &mut self,
+        xpriv: &[u8],
+        compressed: bool,
+        child_index: i32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut store = &mut self.store;
+        let instance = &self.instance;
+
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or(anyhow::anyhow!("memory not found"))?;
+
+        let m_alloc = instance.get_typed_func::<i32, i32, _>(&mut store, "m_alloc")?;
+        let m_free = instance.get_typed_func::<(i32, i32), (), _>(&mut store, "m_free")?;
+        let func = instance.get_typed_func::<(i32, i32, i32, i32), i32, _>(
+            &mut store,
+            "public_key_from_xpriv_child",
+        )?;
+
+        let secret_len = xpriv.len() as i32;
+        let secret_ptr = m_alloc.call(&mut store, secret_len as i32)?;
+        memory.write(&mut store, secret_ptr as usize, xpriv)?;
+
+        let ret_ptr = func.call(
+            &mut store,
+            (
+                secret_ptr,
+                secret_len,
+                if compressed { 1 } else { 0 },
+                child_index,
+            ),
         )?;
         // extracted results free itself
         let res = extract_result(store, &memory, &m_free, ret_ptr)?;
