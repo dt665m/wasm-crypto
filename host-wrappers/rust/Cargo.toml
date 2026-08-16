@@ -4,11 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = "1"
-anyhow = "1"
-wasmtime = "1"
-wasmtime-wasi = "1"
-
-##Sanity Testing
-#k256 = { version = "0.11", default-features = false, features = ["keccak256", "ecdsa", "std"] }
-#sha2 = { version = "0.10.2", default-features = false }
+anyhow = "1.0.104"
+wasmtime = "47.0.3"
+wasmtime-wasi = { version = "47.0.3", features = ["p1"] }

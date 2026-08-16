@@ -1,38 +1,63 @@
 //! Secp256k1 signatures exposed as C FFI for WASM or any other C FFI bindings
 mod output;
-use output::*;
+use output::RawVec;
 
 use coins_bip32::{
     enc::{MainnetEncoder, XKeyEncoder},
     xkeys::Parent,
 };
 
-use k256::{
-    ecdsa::{
-        recoverable::Signature as RecoverableSignature,
-        signature::{DigestSigner, Signer},
-        Signature, SigningKey,
-    },
-    elliptic_curve::sec1::ToEncodedPoint,
+use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
+use sha3::{Digest, Keccak256};
+use std::{
+    alloc::{alloc, dealloc, Layout},
+    mem::size_of,
+    ptr, slice,
 };
-use std::alloc::{alloc, dealloc, Layout};
 
+const SECP256K1_PREHASH_LEN: usize = 32;
+
+/// Allocates a byte buffer in the guest's linear memory.
+///
+/// # Safety
+///
+/// The returned pointer must be released exactly once with [`m_free`] using
+/// the same `len`. Callers must not read or write past the allocated buffer.
 #[no_mangle]
 pub unsafe fn m_alloc(len: usize) -> *mut u8 {
-    let align = std::mem::align_of::<usize>();
-    let layout = Layout::from_size_align_unchecked(len, align);
+    if len == 0 {
+        return ptr::NonNull::dangling().as_ptr();
+    }
+
+    let layout = Layout::array::<u8>(len).expect("allocation size should fit in address space");
     alloc(layout)
 }
 
+/// Releases a byte buffer obtained from [`m_alloc`].
+///
+/// # Safety
+///
+/// `ptr` must be a pointer returned by [`m_alloc`] and `size` must be the
+/// exact length passed to that allocation. The buffer must not be used after
+/// this call.
 #[no_mangle]
 pub unsafe fn m_free(ptr: *mut u8, size: usize) {
-    let align = std::mem::align_of::<usize>();
-    let layout = Layout::from_size_align_unchecked(size, align);
+    if size == 0 {
+        return;
+    }
+
+    let layout = Layout::array::<u8>(size).expect("allocation size should fit in address space");
     dealloc(ptr, layout);
 }
 
 /// Secp256k1 signature.  Assumes payload is pre-hashed.
-/// Recoverable signature is encoded in ASN.1 DER
+/// Recoverable signatures are encoded as r||s||recovery-ID; other signatures
+/// use ASN.1 DER.
+///
+/// # Safety
+///
+/// `pk_ptr` and `msg_ptr` must point to readable guest-memory buffers of
+/// `pk_len` and `msg_len` bytes respectively for the duration of this call.
 #[no_mangle]
 pub unsafe fn sign_secp256k1(
     pk_ptr: *mut u8,
@@ -42,17 +67,21 @@ pub unsafe fn sign_secp256k1(
     recoverable: usize,
 ) -> *const RawVec {
     let (key_bytes, msg_bytes) = parse_input(pk_ptr, pk_len, msg_ptr, msg_len);
-    let signing_key =
-        SigningKey::from_bytes(key_bytes.as_slice()).expect("key should be valid. qed");
+    let signing_key = SigningKey::from_slice(key_bytes).expect("key should be valid");
     to_raw(secp256k1_sign_inner(
         &signing_key,
-        &msg_bytes,
-        if recoverable != 0 { true } else { false },
+        msg_bytes,
+        recoverable != 0,
     ))
 }
 
 /// Secp256k1 recoverable signature.  Hashing is done on the message using
 /// Keccak256.  A raw RLP Ethereum transaction can be used as message
+///
+/// # Safety
+///
+/// `pk_ptr` and `msg_ptr` must point to readable guest-memory buffers of
+/// `pk_len` and `msg_len` bytes respectively for the duration of this call.
 #[no_mangle]
 pub unsafe fn sign_keccak256_secp256k1_recoverable(
     pk_ptr: *mut u8,
@@ -61,15 +90,23 @@ pub unsafe fn sign_keccak256_secp256k1_recoverable(
     msg_len: usize,
 ) -> *const RawVec {
     let (key_bytes, msg_bytes) = parse_input(pk_ptr, pk_len, msg_ptr, msg_len);
-    let signing_key =
-        SigningKey::from_bytes(key_bytes.as_slice()).expect("key should be valid. qed");
-    let sig: RecoverableSignature = signing_key.sign(msg_bytes.as_slice());
-    to_raw(sig.as_ref().to_vec())
+    let signing_key = SigningKey::from_slice(key_bytes).expect("key should be valid");
+    let digest = Keccak256::digest(msg_bytes);
+    let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest);
+    to_raw(recoverable_signature_bytes(
+        signature,
+        recovery_id.to_byte(),
+    ))
 }
 
 /// XPriv Sign
+///
+/// # Safety
+///
+/// `pk_ptr` and `msg_ptr` must point to readable guest-memory buffers of
+/// `pk_len` and `msg_len` bytes respectively for the duration of this call.
 #[no_mangle]
-pub fn xpriv_sign_secp256k1(
+pub unsafe fn xpriv_sign_secp256k1(
     pk_ptr: *mut u8,
     pk_len: usize,
     msg_ptr: *mut u8,
@@ -77,21 +114,24 @@ pub fn xpriv_sign_secp256k1(
     recoverable: usize,
 ) -> *const RawVec {
     let (xpriv_bytes, msg_bytes) = unsafe { parse_input(pk_ptr, pk_len, msg_ptr, msg_len) };
-    let xpriv = unsafe {
-        MainnetEncoder::xpriv_from_base58(std::str::from_utf8_unchecked(&xpriv_bytes))
-            .expect("decoding should succeed")
-    };
+    let xpriv = decode_xpriv(xpriv_bytes);
+    let signing_key = signing_key_from_xpriv(&xpriv);
 
     to_raw(secp256k1_sign_inner(
-        xpriv.as_ref(),
-        &msg_bytes,
-        if recoverable != 0 { true } else { false },
+        &signing_key,
+        msg_bytes,
+        recoverable != 0,
     ))
 }
 
 /// XPriv Sign with Derivation Child Index
+///
+/// # Safety
+///
+/// `pk_ptr` and `msg_ptr` must point to readable guest-memory buffers of
+/// `pk_len` and `msg_len` bytes respectively for the duration of this call.
 #[no_mangle]
-pub fn xpriv_child_sign_secp256k1(
+pub unsafe fn xpriv_child_sign_secp256k1(
     pk_ptr: *mut u8,
     pk_len: usize,
     msg_ptr: *mut u8,
@@ -100,65 +140,78 @@ pub fn xpriv_child_sign_secp256k1(
     child_index: usize,
 ) -> *const RawVec {
     let (xpriv_bytes, msg_bytes) = unsafe { parse_input(pk_ptr, pk_len, msg_ptr, msg_len) };
-    let xpriv = unsafe {
-        MainnetEncoder::xpriv_from_base58(std::str::from_utf8_unchecked(&xpriv_bytes))
-            .expect("decoding should succeed")
-    };
+    let xpriv = decode_xpriv(xpriv_bytes);
     let xpriv = xpriv
         .derive_child(child_index as u32)
-        .expect("child_index should be valid");
+        .expect("child index should be valid");
+    let signing_key = signing_key_from_xpriv(&xpriv);
 
     to_raw(secp256k1_sign_inner(
-        xpriv.as_ref(),
-        &msg_bytes,
-        if recoverable != 0 { true } else { false },
+        &signing_key,
+        msg_bytes,
+        recoverable != 0,
     ))
 }
 
 /// Secp256k1 public key bytes from SecretKey
+///
+/// # Safety
+///
+/// `pk_ptr` must point to a readable guest-memory buffer of `pk_len` bytes
+/// for the duration of this call.
 #[no_mangle]
-pub fn public_key_from_secret(pk_ptr: *mut u8, pk_len: usize, compressed: usize) -> *const RawVec {
-    let signing_key = unsafe {
-        SigningKey::from_bytes(Vec::from_raw_parts(pk_ptr, pk_len, pk_len).as_slice())
-            .expect("key should be valid. qed")
-    };
+pub unsafe fn public_key_from_secret(
+    pk_ptr: *mut u8,
+    pk_len: usize,
+    compressed: usize,
+) -> *const RawVec {
+    let key_bytes = unsafe { input_slice(pk_ptr, pk_len) };
+    let signing_key = SigningKey::from_slice(key_bytes).expect("key should be valid");
     let verifying_key = signing_key.verifying_key();
-    let verifying_key = verifying_key.to_encoded_point(compressed > 0);
+    let verifying_key = verifying_key.to_sec1_point(compressed > 0);
     to_raw(verifying_key.as_bytes().to_vec())
 }
 
 /// Secp256k1 public key bytes from XPriv
+///
+/// # Safety
+///
+/// `pk_ptr` must point to a readable guest-memory buffer of `pk_len` bytes
+/// for the duration of this call.
 #[no_mangle]
-pub fn public_key_from_xpriv(pk_ptr: *mut u8, pk_len: usize, compressed: usize) -> *const RawVec {
-    let xpriv = unsafe {
-        let xpriv_bytes = Vec::from_raw_parts(pk_ptr, pk_len, pk_len);
-        MainnetEncoder::xpriv_from_base58(std::str::from_utf8_unchecked(&xpriv_bytes))
-            .expect("decoding should succeed")
-    };
-    let signing_key: &SigningKey = xpriv.as_ref();
+pub unsafe fn public_key_from_xpriv(
+    pk_ptr: *mut u8,
+    pk_len: usize,
+    compressed: usize,
+) -> *const RawVec {
+    let xpriv_bytes = unsafe { input_slice(pk_ptr, pk_len) };
+    let xpriv = decode_xpriv(xpriv_bytes);
+    let signing_key = signing_key_from_xpriv(&xpriv);
     let verifying_key = signing_key.verifying_key();
-    let verifying_key = verifying_key.to_encoded_point(compressed > 0);
+    let verifying_key = verifying_key.to_sec1_point(compressed > 0);
     to_raw(verifying_key.as_bytes().to_vec())
 }
 
 /// Secp256k1 public key bytes from XPriv Child
+///
+/// # Safety
+///
+/// `pk_ptr` must point to a readable guest-memory buffer of `pk_len` bytes
+/// for the duration of this call.
 #[no_mangle]
-pub fn public_key_from_xpriv_child(
+pub unsafe fn public_key_from_xpriv_child(
     pk_ptr: *mut u8,
     pk_len: usize,
     compressed: usize,
     child_index: usize,
 ) -> *const RawVec {
-    let xpriv = unsafe {
-        let xpriv_bytes = Vec::from_raw_parts(pk_ptr, pk_len, pk_len);
-        MainnetEncoder::xpriv_from_base58(std::str::from_utf8_unchecked(&xpriv_bytes))
-            .expect("decoding should succeed")
-    }
-    .derive_child(child_index as u32)
-    .unwrap();
-    let signing_key: &SigningKey = xpriv.as_ref();
+    let xpriv_bytes = unsafe { input_slice(pk_ptr, pk_len) };
+    let xpriv = decode_xpriv(xpriv_bytes)
+        .derive_child(child_index as u32)
+        .expect("child index should be valid");
+    let signing_key = signing_key_from_xpriv(&xpriv);
     let verifying_key = signing_key.verifying_key();
-    let verifying_key = verifying_key.to_encoded_point(compressed > 0);
+    let verifying_key = verifying_key.to_sec1_point(compressed > 0);
     to_raw(verifying_key.as_bytes().to_vec())
 }
 
@@ -166,134 +219,77 @@ pub fn public_key_from_xpriv_child(
 /// !Recoverable = Bitcoin Style Signature (`der` encoded)
 #[inline]
 fn secp256k1_sign_inner(signing_key: &SigningKey, message: &[u8], recoverable: bool) -> Vec<u8> {
+    assert_eq!(
+        message.len(),
+        SECP256K1_PREHASH_LEN,
+        "message should be a 32-byte secp256k1 prehash"
+    );
+
     if recoverable {
-        DigestSigner::<hash::Sha256Proxy, RecoverableSignature>::sign_digest(
-            signing_key,
-            hash::Sha256Proxy::from(message),
-        )
-        .as_ref()
-        .to_vec()
+        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(message);
+        recoverable_signature_bytes(signature, recovery_id.to_byte())
     } else {
-        DigestSigner::<hash::Sha256Proxy, Signature>::sign_digest(
-            signing_key,
-            hash::Sha256Proxy::from(message),
-        )
-        .to_der()
-        .as_ref()
-        .to_vec()
+        let signature: Signature = signing_key
+            .sign_prehash(message)
+            .expect("message should be a valid secp256k1 prehash");
+        signature.to_der().as_bytes().to_vec()
     }
+}
+
+#[inline]
+fn recoverable_signature_bytes(signature: Signature, recovery_id: u8) -> Vec<u8> {
+    let mut encoded = signature.to_bytes().to_vec();
+    encoded.push(recovery_id);
+    encoded
+}
+
+#[inline]
+fn decode_xpriv(xpriv_bytes: &[u8]) -> coins_bip32::xkeys::XPriv {
+    let xpriv = std::str::from_utf8(xpriv_bytes).expect("xpriv should be valid UTF-8");
+    MainnetEncoder::xpriv_from_base58(xpriv).expect("xpriv should be valid base58")
+}
+
+#[inline]
+fn signing_key_from_xpriv(xpriv: &coins_bip32::xkeys::XPriv) -> SigningKey {
+    let source_key: &coins_bip32::prelude::k256::ecdsa::SigningKey = xpriv.as_ref();
+    SigningKey::from_slice(source_key.to_bytes().as_slice())
+        .expect("xpriv should contain a valid secp256k1 signing key")
 }
 
 /// By default we usually have a key input and msg input
 #[inline]
-unsafe fn parse_input(
+unsafe fn parse_input<'a>(
     pk_ptr: *mut u8,
     pk_len: usize,
     msg_ptr: *mut u8,
     msg_len: usize,
-) -> (Vec<u8>, Vec<u8>) {
-    (
-        Vec::from_raw_parts(pk_ptr, pk_len, pk_len),
-        Vec::from_raw_parts(msg_ptr, msg_len, msg_len),
-    )
+) -> (&'a [u8], &'a [u8]) {
+    (input_slice(pk_ptr, pk_len), input_slice(msg_ptr, msg_len))
+}
+
+#[inline]
+unsafe fn input_slice<'a>(ptr: *mut u8, len: usize) -> &'a [u8] {
+    slice::from_raw_parts(ptr, len)
 }
 
 /// We use C memory layout "serialization" to respond back to the host
 #[inline]
-fn to_raw(mut data: Vec<u8>) -> *const RawVec {
-    let ret_len = data.len();
-    let ptr = data.as_mut_ptr();
+fn to_raw(data: Vec<u8>) -> *const RawVec {
+    let data = data.into_boxed_slice();
+    let data_len = i32::try_from(data.len()).expect("output should fit in wasm32 memory");
+    let data_ptr = Box::into_raw(data) as *mut u8;
 
-    // need to force a heap allocation to write into the linear wasm memory
-    let result = Box::new(RawVec {
-        ptr: ptr as i32,
-        len: ret_len as i32,
-    });
-    // leak the box into a `ptr`
-    let ret = Box::into_raw(result) as *const RawVec;
-
-    // leak pointer so memory isn't dropped when out of scope
-    // `ptr` must be freed by the host caller
-    std::mem::forget(data);
-    ret
-}
-
-mod hash {
-    //! This is a helper module used to pass the pre-hashed message for signing to the
-    //! `sign_digest` methods of K256.
-    use coins_bip32::prelude::k256::ecdsa::signature::digest::{
-        generic_array::GenericArray, Digest, FixedOutput, FixedOutputReset, HashMarker, Output,
-        OutputSizeUser, Reset, Update,
+    let descriptor_ptr = unsafe { m_alloc(size_of::<RawVec>()) };
+    let descriptor = RawVec {
+        ptr: data_ptr as i32,
+        len: data_len,
     };
-
-    pub type Sha256Proxy = ProxyDigest<sha2::Sha256>;
-
-    #[derive(Clone)]
-    pub enum ProxyDigest<D: Digest> {
-        Proxy(Output<D>),
-        Digest(D),
+    unsafe {
+        ptr::copy_nonoverlapping(
+            (&descriptor as *const RawVec).cast::<u8>(),
+            descriptor_ptr,
+            size_of::<RawVec>(),
+        );
     }
-
-    impl<D: Digest + Clone> From<&[u8]> for ProxyDigest<D>
-    where
-        GenericArray<u8, <D as OutputSizeUser>::OutputSize>: Copy,
-    {
-        fn from(src: &[u8]) -> Self {
-            ProxyDigest::Proxy(*GenericArray::from_slice(src))
-        }
-    }
-
-    impl<D: Digest> Default for ProxyDigest<D> {
-        fn default() -> Self {
-            ProxyDigest::Digest(D::new())
-        }
-    }
-
-    impl<D: Digest> Update for ProxyDigest<D> {
-        // we update only if we are digest
-        fn update(&mut self, data: &[u8]) {
-            match self {
-                ProxyDigest::Digest(ref mut d) => {
-                    d.update(data);
-                }
-                ProxyDigest::Proxy(..) => {
-                    unreachable!("can not update if we are proxy");
-                }
-            }
-        }
-    }
-
-    impl<D: Digest> HashMarker for ProxyDigest<D> {}
-
-    impl<D: Digest> Reset for ProxyDigest<D> {
-        // make new one
-        fn reset(&mut self) {
-            *self = Self::default();
-        }
-    }
-
-    impl<D: Digest> OutputSizeUser for ProxyDigest<D> {
-        // we default to the output of the original digest
-        type OutputSize = <D as OutputSizeUser>::OutputSize;
-    }
-
-    impl<D: Digest> FixedOutput for ProxyDigest<D> {
-        fn finalize_into(self, out: &mut GenericArray<u8, Self::OutputSize>) {
-            match self {
-                ProxyDigest::Digest(d) => {
-                    *out = d.finalize();
-                }
-                ProxyDigest::Proxy(p) => {
-                    *out = p;
-                }
-            }
-        }
-    }
-
-    impl<D: Digest> FixedOutputReset for ProxyDigest<D> {
-        fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
-            let s = std::mem::take(self);
-            Digest::finalize_into(s, out)
-        }
-    }
+    descriptor_ptr.cast::<RawVec>()
 }

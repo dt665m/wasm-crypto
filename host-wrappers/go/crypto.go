@@ -1,17 +1,22 @@
 package WasmCrypto
 
 import (
-	"bytes"
 	_ "embed"
 	"encoding/binary"
 	"fmt"
 	"sync"
 
-	"github.com/bytecodealliance/wasmtime-go"
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v47"
+)
+
+const (
+	secp256k1PrehashLength = 32
+	rawVecLength           = 8
+	maxWasmI32             = int(^uint32(0) >> 1)
 )
 
 //go:embed wasm_crypto.wasi.wasm
-var wasm_bytes []byte
+var wasmBytes []byte
 
 type WasmCrypto struct {
 	mu       sync.Mutex
@@ -21,355 +26,292 @@ type WasmCrypto struct {
 	instance *wasmtime.Instance
 }
 
+type wasmAllocation struct {
+	ptr int32
+	len int32
+}
+
 func NewWasmCrypto() (*WasmCrypto, error) {
 	engine := wasmtime.NewEngine()
 	store := wasmtime.NewStore(engine)
 	linker := wasmtime.NewLinker(engine)
 
-	// Configure WASI imports to write stdout into a file.
-	wasiConfig := wasmtime.NewWasiConfig()
-	// wasiConfig.SetStdoutFile(stdoutPath)
-	wasiConfig.InheritEnv()
-	wasiConfig.InheritStdout()
-	store.SetWasi(wasiConfig)
+	// The guest only needs the WASI ABI; do not pass the host environment,
+	// filesystem, stdin, or stdout through to a signing process.
+	store.SetWasi(wasmtime.NewWasiConfig())
 	linker.DefineWasi()
 
-	// Create our module
-	module, err := wasmtime.NewModule(store.Engine, wasm_bytes)
+	module, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("compile wasm crypto module: %w", err)
 	}
 	instance, err := linker.Instantiate(store, module)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("instantiate wasm crypto module: %w", err)
 	}
 
 	return &WasmCrypto{
-		store:  store,
-		engine: engine,
-		linker: linker, instance: instance,
+		store:    store,
+		engine:   engine,
+		linker:   linker,
+		instance: instance,
 	}, nil
 }
 
+// SignSecp256k1 signs a 32-byte prehash. Recoverable signatures are encoded
+// as 64-byte r||s followed by a one-byte recovery ID; non-recoverable
+// signatures are ASN.1 DER.
 func (c *WasmCrypto) SignSecp256k1(secretKey, message []byte, recoverable bool) ([]byte, error) {
+	if err := requirePrehash(message); err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.invoke("sign_secp256k1", [][]byte{secretKey, message}, func(inputs []wasmAllocation) []interface{} {
+		return []interface{}{
+			inputs[0].ptr, inputs[0].len,
+			inputs[1].ptr, inputs[1].len,
+			wasmBool(recoverable),
+		}
+	})
+}
 
-	memory := c.instance.GetExport(c.store, "memory").Memory()
-	mAlloc := c.instance.GetExport(c.store, "m_alloc").Func()
-	mFree := c.instance.GetExport(c.store, "m_free").Func()
-	secp256k1Sign := c.instance.GetExport(c.store, "sign_secp256k1").Func()
-
-	messageLen := int32(32)
-	secretKeyLen := int32(len(secretKey))
-
-	// Allocate
-	keyAlloc, err := mAlloc.Call(c.store, secretKeyLen)
-	if err != nil {
-		return nil, err
-	}
-	keyPtr, _ := keyAlloc.(int32)
-	msgAlloc, err := mAlloc.Call(c.store, messageLen)
-	if err != nil {
-		return nil, err
-	}
-	msgPtr, _ := msgAlloc.(int32)
-
-	buf := memory.UnsafeData(c.store)
-	copy(buf[keyPtr:keyPtr+secretKeyLen], secretKey)
-	copy(buf[msgPtr:msgPtr+messageLen], message)
-	rec := 0
-	if recoverable {
-		rec = 1
-	}
-	callResult, err := secp256k1Sign.Call(c.store, keyPtr, secretKeyLen, msgPtr, messageLen, rec)
-	if err != nil {
-		return nil, err
-	}
-	retPtr := callResult.(int32)
-
-	// Free key
-	if _, err = mFree.Call(c.store, keyPtr, secretKeyLen); err != nil {
-		return nil, err
-	}
-	// Free msg
-	if _, err = mFree.Call(c.store, msgPtr, messageLen); err != nil {
-		return nil, err
-	}
-
-	return extract_result(c.store, buf, mFree, retPtr)
+// SignKeccak256Recoverable hashes message with Keccak-256 before producing an
+// r||s||recovery-ID signature.
+func (c *WasmCrypto) SignKeccak256Recoverable(secretKey, message []byte) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.invoke("sign_keccak256_secp256k1_recoverable", [][]byte{secretKey, message}, func(inputs []wasmAllocation) []interface{} {
+		return []interface{}{
+			inputs[0].ptr, inputs[0].len,
+			inputs[1].ptr, inputs[1].len,
+		}
+	})
 }
 
 func (c *WasmCrypto) XPrivSignSecp256k1(xpriv, message []byte, recoverable bool) ([]byte, error) {
+	if err := requirePrehash(message); err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	memory := c.instance.GetExport(c.store, "memory").Memory()
-	mAlloc := c.instance.GetExport(c.store, "m_alloc").Func()
-	mFree := c.instance.GetExport(c.store, "m_free").Func()
-	fn := c.instance.GetExport(c.store, "xpriv_sign_secp256k1").Func()
-
-	messageLen := int32(32)
-	secretKeyLen := int32(len(xpriv))
-
-	// Allocate
-	keyAlloc, err := mAlloc.Call(c.store, secretKeyLen)
-	if err != nil {
-		return nil, err
-	}
-	keyPtr, _ := keyAlloc.(int32)
-	msgAlloc, err := mAlloc.Call(c.store, messageLen)
-	if err != nil {
-		return nil, err
-	}
-	msgPtr, _ := msgAlloc.(int32)
-
-	buf := memory.UnsafeData(c.store)
-	copy(buf[keyPtr:keyPtr+secretKeyLen], xpriv)
-	copy(buf[msgPtr:msgPtr+messageLen], message)
-	rec := 0
-	if recoverable {
-		rec = 1
-	}
-	callResult, err := fn.Call(c.store, keyPtr, secretKeyLen, msgPtr, messageLen, rec)
-	if err != nil {
-		return nil, err
-	}
-	retPtr := callResult.(int32)
-	res, err := extract_result(c.store, buf, mFree, retPtr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Free key
-	if _, err = mFree.Call(c.store, keyPtr, secretKeyLen); err != nil {
-		return nil, err
-	}
-	// Free msg
-	if _, err = mFree.Call(c.store, msgPtr, messageLen); err != nil {
-		return nil, err
-	}
-
-	return res, nil
+	return c.invoke("xpriv_sign_secp256k1", [][]byte{xpriv, message}, func(inputs []wasmAllocation) []interface{} {
+		return []interface{}{
+			inputs[0].ptr, inputs[0].len,
+			inputs[1].ptr, inputs[1].len,
+			wasmBool(recoverable),
+		}
+	})
 }
 
 func (c *WasmCrypto) XPrivChildSignSecp256k1(xpriv, message []byte, recoverable bool, childIndex int32) ([]byte, error) {
+	if err := requirePrehash(message); err != nil {
+		return nil, err
+	}
+	if err := requireChildIndex(childIndex); err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	memory := c.instance.GetExport(c.store, "memory").Memory()
-	mAlloc := c.instance.GetExport(c.store, "m_alloc").Func()
-	mFree := c.instance.GetExport(c.store, "m_free").Func()
-	fn := c.instance.GetExport(c.store, "xpriv_child_sign_secp256k1").Func()
-
-	messageLen := int32(32)
-	secretKeyLen := int32(len(xpriv))
-
-	// Allocate
-	keyAlloc, err := mAlloc.Call(c.store, secretKeyLen)
-	if err != nil {
-		return nil, err
-	}
-	keyPtr, _ := keyAlloc.(int32)
-	msgAlloc, err := mAlloc.Call(c.store, messageLen)
-	if err != nil {
-		return nil, err
-	}
-	msgPtr, _ := msgAlloc.(int32)
-
-	buf := memory.UnsafeData(c.store)
-	copy(buf[keyPtr:keyPtr+secretKeyLen], xpriv)
-	copy(buf[msgPtr:msgPtr+messageLen], message)
-	rec := 0
-	if recoverable {
-		rec = 1
-	}
-	callResult, err := fn.Call(c.store, keyPtr, secretKeyLen, msgPtr, messageLen, rec, childIndex)
-	if err != nil {
-		return nil, err
-	}
-	retPtr := callResult.(int32)
-	res, err := extract_result(c.store, buf, mFree, retPtr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Free key
-	if _, err = mFree.Call(c.store, keyPtr, secretKeyLen); err != nil {
-		return nil, err
-	}
-	// Free msg
-	if _, err = mFree.Call(c.store, msgPtr, messageLen); err != nil {
-		return nil, err
-	}
-
-	return res, nil
+	return c.invoke("xpriv_child_sign_secp256k1", [][]byte{xpriv, message}, func(inputs []wasmAllocation) []interface{} {
+		return []interface{}{
+			inputs[0].ptr, inputs[0].len,
+			inputs[1].ptr, inputs[1].len,
+			wasmBool(recoverable), childIndex,
+		}
+	})
 }
 
 func (c *WasmCrypto) PublicKey(secretKey []byte, compressed bool) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	memory := c.instance.GetExport(c.store, "memory").Memory()
-	mAlloc := c.instance.GetExport(c.store, "m_alloc").Func()
-	mFree := c.instance.GetExport(c.store, "m_free").Func()
-	publicKey := c.instance.GetExport(c.store, "public_key_from_secret").Func()
-
-	secretKeyLen := int32(len(secretKey))
-
-	// Allocate
-	keyAlloc, err := mAlloc.Call(c.store, secretKeyLen)
-	if err != nil {
-		return nil, err
-	}
-	keyPtr, _ := keyAlloc.(int32)
-
-	buf := memory.UnsafeData(c.store)
-	copy(buf[keyPtr:keyPtr+secretKeyLen], secretKey)
-	comp := 0
-	if compressed {
-		comp = 1
-	}
-	callResult, err := publicKey.Call(c.store, keyPtr, secretKeyLen, comp)
-	if err != nil {
-		return nil, err
-	}
-
-	retPtr := callResult.(int32)
-	res, err := extract_result(c.store, buf, mFree, retPtr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Free
-	if _, err = mFree.Call(c.store, keyPtr, secretKeyLen); err != nil {
-		return nil, err
-	}
-
-	return res, nil
+	return c.invoke("public_key_from_secret", [][]byte{secretKey}, func(inputs []wasmAllocation) []interface{} {
+		return []interface{}{inputs[0].ptr, inputs[0].len, wasmBool(compressed)}
+	})
 }
 
 func (c *WasmCrypto) PublicKeyXPriv(xpriv []byte, compressed bool) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	memory := c.instance.GetExport(c.store, "memory").Memory()
-	mAlloc := c.instance.GetExport(c.store, "m_alloc").Func()
-	mFree := c.instance.GetExport(c.store, "m_free").Func()
-	publicKey := c.instance.GetExport(c.store, "public_key_from_xpriv").Func()
-
-	secretKeyLen := int32(len(xpriv))
-
-	// Allocate
-	keyAlloc, err := mAlloc.Call(c.store, secretKeyLen)
-	if err != nil {
-		return nil, err
-	}
-	keyPtr, _ := keyAlloc.(int32)
-
-	buf := memory.UnsafeData(c.store)
-	copy(buf[keyPtr:keyPtr+secretKeyLen], xpriv)
-	comp := 0
-	if compressed {
-		comp = 1
-	}
-	callResult, err := publicKey.Call(c.store, keyPtr, secretKeyLen, comp)
-	if err != nil {
-		return nil, err
-	}
-
-	retPtr := callResult.(int32)
-	res, err := extract_result(c.store, buf, mFree, retPtr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Free
-	if _, err = mFree.Call(c.store, keyPtr, secretKeyLen); err != nil {
-		return nil, err
-	}
-
-	return res, nil
+	return c.invoke("public_key_from_xpriv", [][]byte{xpriv}, func(inputs []wasmAllocation) []interface{} {
+		return []interface{}{inputs[0].ptr, inputs[0].len, wasmBool(compressed)}
+	})
 }
 
 func (c *WasmCrypto) PublicKeyXPrivChild(xpriv []byte, compressed bool, childIndex int32) ([]byte, error) {
+	if err := requireChildIndex(childIndex); err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	memory := c.instance.GetExport(c.store, "memory").Memory()
-	mAlloc := c.instance.GetExport(c.store, "m_alloc").Func()
-	mFree := c.instance.GetExport(c.store, "m_free").Func()
-	publicKey := c.instance.GetExport(c.store, "public_key_from_xpriv_child").Func()
-
-	secretKeyLen := int32(len(xpriv))
-
-	// Allocate
-	keyAlloc, err := mAlloc.Call(c.store, secretKeyLen)
-	if err != nil {
-		return nil, err
-	}
-	keyPtr, _ := keyAlloc.(int32)
-
-	buf := memory.UnsafeData(c.store)
-	copy(buf[keyPtr:keyPtr+secretKeyLen], xpriv)
-	comp := 0
-	if compressed {
-		comp = 1
-	}
-	callResult, err := publicKey.Call(c.store, keyPtr, secretKeyLen, comp, childIndex)
-	if err != nil {
-		return nil, err
-	}
-
-	retPtr := callResult.(int32)
-	res, err := extract_result(c.store, buf, mFree, retPtr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Free
-	if _, err = mFree.Call(c.store, keyPtr, secretKeyLen); err != nil {
-		return nil, err
-	}
-
-	return res, nil
+	return c.invoke("public_key_from_xpriv_child", [][]byte{xpriv}, func(inputs []wasmAllocation) []interface{} {
+		return []interface{}{inputs[0].ptr, inputs[0].len, wasmBool(compressed), childIndex}
+	})
 }
 
-// #HACK we know the C Repr of the Rust `RawVec` return value so we will hack this instead
-// of messing with C.GO
-// RAW [144, 66, 16, 0, 65, 0, 0, 0]
-// RAW STRUCT RawVec { ptr: 1065616, len: 65 }
-func extract_result(store *wasmtime.Store, memBuf []byte, mFree *wasmtime.Func, retPtr int32) ([]byte, error) {
-	rawLen := 8 // two i32 values
-	raw := make([]byte, rawLen)
-	copy(raw, memBuf[retPtr:retPtr+int32(rawLen)])
-
-	var dataPtr int32
-	rdr := bytes.NewReader(raw)
-	err := binary.Read(rdr, binary.LittleEndian, &dataPtr)
+func (c *WasmCrypto) invoke(
+	functionName string,
+	inputs [][]byte,
+	arguments func([]wasmAllocation) []interface{},
+) (result []byte, err error) {
+	memory, mAlloc, mFree, function, err := c.exports(functionName)
 	if err != nil {
-		fmt.Println("dataPtr binary.Read failed:", err)
 		return nil, err
 	}
-	var dataLen int32
-	err = binary.Read(rdr, binary.LittleEndian, &dataLen)
+
+	allocations := make([]wasmAllocation, 0, len(inputs))
+	defer func() {
+		cleanupErr := c.releaseInputs(memory, mFree, allocations)
+		if err == nil && cleanupErr != nil {
+			err = cleanupErr
+		}
+	}()
+
+	for _, input := range inputs {
+		allocation, allocationErr := c.allocateInput(memory, mAlloc, input)
+		if allocationErr != nil {
+			return nil, allocationErr
+		}
+		allocations = append(allocations, allocation)
+	}
+
+	value, err := function.Call(c.store, arguments(allocations)...)
 	if err != nil {
-		fmt.Println("dataPtr binary.Read failed:", err)
-		return nil, err
+		return nil, fmt.Errorf("call %s: %w", functionName, err)
 	}
-	// fmt.Printf("DataPtr %d, DataLen %d\n", dataPtr, dataLen)
-
-	ret := make([]byte, dataLen)
-	copy(ret, memBuf[dataPtr:dataPtr+dataLen])
-
-	// free the RawVec container
-	if _, err = mFree.Call(store, retPtr, rawLen); err != nil {
-		return nil, err
-	}
-	// free the Bytes referenced by RawVec
-	if _, err = mFree.Call(store, retPtr, rawLen); err != nil {
-		return nil, err
+	resultPtr, ok := value.(int32)
+	if !ok {
+		return nil, fmt.Errorf("%s returned %T, expected i32", functionName, value)
 	}
 
-	return ret, nil
+	return c.extractResult(memory, mFree, resultPtr)
+}
+
+func (c *WasmCrypto) exports(functionName string) (*wasmtime.Memory, *wasmtime.Func, *wasmtime.Func, *wasmtime.Func, error) {
+	memoryExport := c.instance.GetExport(c.store, "memory")
+	if memoryExport == nil || memoryExport.Memory() == nil {
+		return nil, nil, nil, nil, fmt.Errorf("wasm crypto module does not export memory")
+	}
+	mAllocExport := c.instance.GetExport(c.store, "m_alloc")
+	if mAllocExport == nil || mAllocExport.Func() == nil {
+		return nil, nil, nil, nil, fmt.Errorf("wasm crypto module does not export m_alloc")
+	}
+	mFreeExport := c.instance.GetExport(c.store, "m_free")
+	if mFreeExport == nil || mFreeExport.Func() == nil {
+		return nil, nil, nil, nil, fmt.Errorf("wasm crypto module does not export m_free")
+	}
+	functionExport := c.instance.GetExport(c.store, functionName)
+	if functionExport == nil || functionExport.Func() == nil {
+		return nil, nil, nil, nil, fmt.Errorf("wasm crypto module does not export %s", functionName)
+	}
+	return memoryExport.Memory(), mAllocExport.Func(), mFreeExport.Func(), functionExport.Func(), nil
+}
+
+func (c *WasmCrypto) allocateInput(memory *wasmtime.Memory, mAlloc *wasmtime.Func, input []byte) (wasmAllocation, error) {
+	length, err := wasmLength(len(input))
+	if err != nil {
+		return wasmAllocation{}, err
+	}
+	value, err := mAlloc.Call(c.store, length)
+	if err != nil {
+		return wasmAllocation{}, fmt.Errorf("allocate guest input: %w", err)
+	}
+	ptr, ok := value.(int32)
+	if !ok {
+		return wasmAllocation{}, fmt.Errorf("m_alloc returned %T, expected i32", value)
+	}
+
+	allocation := wasmAllocation{ptr: ptr, len: length}
+	guestMemory, err := c.memoryRange(memory, ptr, length)
+	if err != nil {
+		return wasmAllocation{}, err
+	}
+	copy(guestMemory, input)
+	return allocation, nil
+}
+
+func (c *WasmCrypto) releaseInputs(memory *wasmtime.Memory, mFree *wasmtime.Func, allocations []wasmAllocation) error {
+	for i := len(allocations) - 1; i >= 0; i-- {
+		allocation := allocations[i]
+		if guestMemory, err := c.memoryRange(memory, allocation.ptr, allocation.len); err == nil {
+			clear(guestMemory)
+		}
+		if _, err := mFree.Call(c.store, allocation.ptr, allocation.len); err != nil {
+			return fmt.Errorf("free guest input: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c *WasmCrypto) extractResult(memory *wasmtime.Memory, mFree *wasmtime.Func, resultPtr int32) (result []byte, err error) {
+	defer func() {
+		if _, freeErr := mFree.Call(c.store, resultPtr, int32(rawVecLength)); err == nil && freeErr != nil {
+			err = fmt.Errorf("free guest result descriptor: %w", freeErr)
+		}
+	}()
+
+	descriptor, err := c.memoryRange(memory, resultPtr, rawVecLength)
+	if err != nil {
+		return nil, err
+	}
+	dataPtr := int32(binary.LittleEndian.Uint32(descriptor[:4]))
+	dataLen := int32(binary.LittleEndian.Uint32(descriptor[4:]))
+	if dataPtr < 0 || dataLen < 0 {
+		return nil, fmt.Errorf("guest returned an invalid result descriptor")
+	}
+	defer func() {
+		if _, freeErr := mFree.Call(c.store, dataPtr, dataLen); err == nil && freeErr != nil {
+			err = fmt.Errorf("free guest result bytes: %w", freeErr)
+		}
+	}()
+
+	data, err := c.memoryRange(memory, dataPtr, dataLen)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), data...), nil
+}
+
+func (c *WasmCrypto) memoryRange(memory *wasmtime.Memory, ptr, length int32) ([]byte, error) {
+	if ptr < 0 || length < 0 {
+		return nil, fmt.Errorf("negative wasm memory range")
+	}
+	end := int64(ptr) + int64(length)
+	guestMemory := memory.UnsafeData(c.store)
+	if end > int64(len(guestMemory)) {
+		return nil, fmt.Errorf("wasm memory range [%d:%d] exceeds %d bytes", ptr, end, len(guestMemory))
+	}
+	return guestMemory[int(ptr):int(end)], nil
+}
+
+func requirePrehash(message []byte) error {
+	if len(message) != secp256k1PrehashLength {
+		return fmt.Errorf("secp256k1 message must be a %d-byte prehash, got %d bytes", secp256k1PrehashLength, len(message))
+	}
+	return nil
+}
+
+func requireChildIndex(childIndex int32) error {
+	if childIndex < 0 {
+		return fmt.Errorf("BIP32 child index must not be negative")
+	}
+	return nil
+}
+
+func wasmLength(length int) (int32, error) {
+	if length > maxWasmI32 {
+		return 0, fmt.Errorf("input is too large for wasm32 memory")
+	}
+	return int32(length), nil
+}
+
+func wasmBool(value bool) int32 {
+	if value {
+		return 1
+	}
+	return 0
 }

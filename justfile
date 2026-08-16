@@ -24,9 +24,7 @@ deps-rust:
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 deps-wasm:
-    curl https://wasmtime.dev/install.sh -sSf | bash
-    rustup target add wasm32-wasi
-    cargo install cargo-wasi
+    rustup target add wasm32-wasip1
 
 ###########################################################
 ### Build 
@@ -35,10 +33,9 @@ deps-wasm:
 build:
     #!/usr/bin/env bash
     set -euxo pipefail
-    cargo wasi build --release
-    #RUSTFLAGS="-C target-feature=+multivalue" cargo wasi build --release
-    cp ./target/wasm32-wasi/release/wasm_crypto.wasi.wasm ./host-wrappers/rust/src
-    cp ./target/wasm32-wasi/release/wasm_crypto.wasi.wasm ./host-wrappers/go
+    cargo build --target wasm32-wasip1 --release
+    cp ./target/wasm32-wasip1/release/wasm_crypto.wasm ./host-wrappers/rust/src/wasm_crypto.wasi.wasm
+    cp ./target/wasm32-wasip1/release/wasm_crypto.wasm ./host-wrappers/go/wasm_crypto.wasi.wasm
 
 tag:
 	git tag -a v{{SEM_VER}} -m "v{{SEM_VER}}"
@@ -72,4 +69,3 @@ clippy-hack:
 
 ###########################################################
 ### Integration Tests
-
