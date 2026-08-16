@@ -1,8 +1,10 @@
 package WasmCryptoTest
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,4 +112,106 @@ func TestWasmCryptoClose(t *testing.T) {
 
 	_, err = signer.PublicKey(make([]byte, 32), true)
 	assert.EqualError(t, err, "wasm crypto signer is closed")
+}
+
+func TestSharedRuntimeConcurrentSigners(t *testing.T) {
+	runtime, err := WasmCrypto.NewRuntime()
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+	defer runtime.Close()
+
+	xpriv := []byte("xprv9s21ZrQH143K3fsbwbm3Q3JcUcd1VSJ2ukikDvzLaLpLbiy7buQqDAiw3LwoNp5RSjreg3G6aVTYa9MjVqAyocx3AjSNH4tgfoXiJftznyN")
+	message := make([]byte, 32)
+	const signerCount = 8
+
+	results := make(chan []byte, signerCount)
+	errors := make(chan error, signerCount)
+	var wait sync.WaitGroup
+	for range signerCount {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			signer, err := runtime.NewWasmCrypto()
+			if err != nil {
+				errors <- err
+				return
+			}
+			defer signer.Close()
+
+			signature, err := signer.XPrivSignSecp256k1(xpriv, message, true)
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- signature
+		}()
+	}
+	wait.Wait()
+	close(results)
+	close(errors)
+
+	for err := range errors {
+		assert.NoError(t, err)
+	}
+	var expected []byte
+	for signature := range results {
+		if expected == nil {
+			expected = signature
+			continue
+		}
+		assert.True(t, bytes.Equal(expected, signature))
+	}
+	assert.Len(t, expected, 65)
+
+	assert.NoError(t, runtime.Close())
+	assert.NoError(t, runtime.Close())
+	_, err = runtime.NewWasmCrypto()
+	assert.EqualError(t, err, "wasm crypto runtime is closed")
+}
+
+func BenchmarkXPrivSignFreshCompilation(b *testing.B) {
+	xpriv := []byte("xprv9s21ZrQH143K3fsbwbm3Q3JcUcd1VSJ2ukikDvzLaLpLbiy7buQqDAiw3LwoNp5RSjreg3G6aVTYa9MjVqAyocx3AjSNH4tgfoXiJftznyN")
+	message := make([]byte, 32)
+	b.ReportAllocs()
+
+	for range b.N {
+		signer, err := WasmCrypto.NewWasmCrypto()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := signer.XPrivSignSecp256k1(xpriv, message, true); err != nil {
+			b.Fatal(err)
+		}
+		if err := signer.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkXPrivSignSharedCompilation(b *testing.B) {
+	runtime, err := WasmCrypto.NewRuntime()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = runtime.Close() })
+
+	xpriv := []byte("xprv9s21ZrQH143K3fsbwbm3Q3JcUcd1VSJ2ukikDvzLaLpLbiy7buQqDAiw3LwoNp5RSjreg3G6aVTYa9MjVqAyocx3AjSNH4tgfoXiJftznyN")
+	message := make([]byte, 32)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		signer, err := runtime.NewWasmCrypto()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := signer.XPrivSignSecp256k1(xpriv, message, true); err != nil {
+			b.Fatal(err)
+		}
+		if err := signer.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

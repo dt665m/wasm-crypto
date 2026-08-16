@@ -19,12 +19,13 @@ const (
 var wasmBytes []byte
 
 type WasmCrypto struct {
-	mu       sync.Mutex
-	store    *wasmtime.Store
-	engine   *wasmtime.Engine
-	linker   *wasmtime.Linker
-	instance *wasmtime.Instance
-	closed   bool
+	mu          sync.Mutex
+	store       *wasmtime.Store
+	linker      *wasmtime.Linker
+	instance    *wasmtime.Instance
+	runtime     *Runtime
+	ownsRuntime bool
+	closed      bool
 }
 
 type wasmAllocation struct {
@@ -33,47 +34,23 @@ type wasmAllocation struct {
 }
 
 func NewWasmCrypto() (*WasmCrypto, error) {
-	engine := wasmtime.NewEngine()
-	store := wasmtime.NewStore(engine)
-	linker := wasmtime.NewLinker(engine)
-	closeRuntime := func() {
-		linker.Close()
-		store.Close()
-		engine.Close()
-	}
-
-	// The guest only needs the WASI ABI; do not pass the host environment,
-	// filesystem, stdin, or stdout through to a signing process.
-	store.SetWasi(wasmtime.NewWasiConfig())
-	if err := linker.DefineWasi(); err != nil {
-		closeRuntime()
-		return nil, fmt.Errorf("define WASI imports: %w", err)
-	}
-
-	module, err := wasmtime.NewModule(engine, wasmBytes)
+	runtime, err := NewRuntime()
 	if err != nil {
-		closeRuntime()
-		return nil, fmt.Errorf("compile wasm crypto module: %w", err)
+		return nil, err
 	}
-
-	instance, err := linker.Instantiate(store, module)
-	module.Close()
+	signer, err := runtime.NewWasmCrypto()
 	if err != nil {
-		closeRuntime()
-		return nil, fmt.Errorf("instantiate wasm crypto module: %w", err)
+		_ = runtime.Close()
+		return nil, err
 	}
-
-	return &WasmCrypto{
-		store:    store,
-		engine:   engine,
-		linker:   linker,
-		instance: instance,
-	}, nil
+	signer.ownsRuntime = true
+	return signer, nil
 }
 
-// Close immediately releases Wasmtime's native linker, store, and engine
-// allocations. It is safe to call more than once. The signer must not be used
-// after Close returns.
+// Close immediately releases the signer's native Linker and Store. It also
+// releases an internally owned Runtime when the package-level constructor was
+// used. It is safe to call more than once. The signer must not be used after
+// Close returns.
 func (c *WasmCrypto) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -84,6 +61,11 @@ func (c *WasmCrypto) Close() error {
 	c.closed = true
 	c.instance = nil
 
+	runtime := c.runtime
+	ownsRuntime := c.ownsRuntime
+	c.runtime = nil
+	c.ownsRuntime = false
+
 	if c.linker != nil {
 		c.linker.Close()
 		c.linker = nil
@@ -92,9 +74,11 @@ func (c *WasmCrypto) Close() error {
 		c.store.Close()
 		c.store = nil
 	}
-	if c.engine != nil {
-		c.engine.Close()
-		c.engine = nil
+	if runtime != nil {
+		runtime.release()
+		if ownsRuntime {
+			return runtime.Close()
+		}
 	}
 	return nil
 }
