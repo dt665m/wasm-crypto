@@ -11,12 +11,12 @@ import (
 // concurrent signers. Each signer still receives an independent Store,
 // Instance, and linear memory.
 type Runtime struct {
-	mu     sync.Mutex
-	active sync.WaitGroup
-	engine *wasmtime.Engine
-	module *wasmtime.Module
-	closed bool
-	done   chan struct{}
+	mu        sync.Mutex
+	active    sync.WaitGroup
+	closeOnce sync.Once
+	engine    *wasmtime.Engine
+	module    *wasmtime.Module
+	closed    bool
 }
 
 // NewRuntime compiles the embedded WASM module once for reuse across signers.
@@ -30,7 +30,6 @@ func NewRuntime() (*Runtime, error) {
 	return &Runtime{
 		engine: engine,
 		module: module,
-		done:   make(chan struct{}),
 	}, nil
 }
 
@@ -90,25 +89,14 @@ func (r *Runtime) release() {
 // releases the shared compiled Module and Engine. It is safe to call more than
 // once or concurrently.
 func (r *Runtime) Close() error {
-	r.mu.Lock()
-	if r.closed {
-		done := r.done
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		r.closed = true
 		r.mu.Unlock()
-		<-done
-		return nil
-	}
-	r.closed = true
-	done := r.done
-	r.mu.Unlock()
 
-	r.active.Wait()
-	r.module.Close()
-	r.engine.Close()
-
-	r.mu.Lock()
-	r.module = nil
-	r.engine = nil
-	close(done)
-	r.mu.Unlock()
+		r.active.Wait()
+		r.module.Close()
+		r.engine.Close()
+	})
 	return nil
 }
