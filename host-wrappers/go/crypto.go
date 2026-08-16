@@ -45,16 +45,19 @@ func NewWasmCrypto() (*WasmCrypto, error) {
 	// The guest only needs the WASI ABI; do not pass the host environment,
 	// filesystem, stdin, or stdout through to a signing process.
 	store.SetWasi(wasmtime.NewWasiConfig())
-	linker.DefineWasi()
+	if err := linker.DefineWasi(); err != nil {
+		closeRuntime()
+		return nil, fmt.Errorf("define WASI imports: %w", err)
+	}
 
 	module, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
 		closeRuntime()
 		return nil, fmt.Errorf("compile wasm crypto module: %w", err)
 	}
-	defer module.Close()
 
 	instance, err := linker.Instantiate(store, module)
+	module.Close()
 	if err != nil {
 		closeRuntime()
 		return nil, fmt.Errorf("instantiate wasm crypto module: %w", err)
