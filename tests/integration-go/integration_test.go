@@ -28,6 +28,12 @@ func TestWasmCrypto(t *testing.T) {
 	start := time.Now()
 
 	signer, err1 := WasmCrypto.NewWasmCrypto()
+	assert.NoError(t, err1)
+	if err1 != nil {
+		return
+	}
+	defer signer.Close()
+
 	wasmSig, err2 := signer.SignSecp256k1(secretKey, message, true)
 	wasmXprivSig, err3 := signer.XPrivSignSecp256k1(xprivB58, message, true)
 	wasmXprivChildSig, err4 := signer.XPrivChildSignSecp256k1(xprivB58, message, true, childIndex)
@@ -90,4 +96,18 @@ func TestWasmCrypto(t *testing.T) {
 	fmt.Println("public key compressed:", wasmPubKeyCompressed)
 	fmt.Println("public key compressed length:", len(wasmPubKeyCompressed))
 	fmt.Printf("elapsed: %s\n", elapsed)
+}
+
+func TestWasmCryptoClose(t *testing.T) {
+	signer, err := WasmCrypto.NewWasmCrypto()
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+
+	assert.NoError(t, signer.Close())
+	assert.NoError(t, signer.Close())
+
+	_, err = signer.PublicKey(make([]byte, 32), true)
+	assert.EqualError(t, err, "wasm crypto signer is closed")
 }

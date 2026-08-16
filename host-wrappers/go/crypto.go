@@ -24,6 +24,7 @@ type WasmCrypto struct {
 	engine   *wasmtime.Engine
 	linker   *wasmtime.Linker
 	instance *wasmtime.Instance
+	closed   bool
 }
 
 type wasmAllocation struct {
@@ -35,6 +36,11 @@ func NewWasmCrypto() (*WasmCrypto, error) {
 	engine := wasmtime.NewEngine()
 	store := wasmtime.NewStore(engine)
 	linker := wasmtime.NewLinker(engine)
+	closeRuntime := func() {
+		linker.Close()
+		store.Close()
+		engine.Close()
+	}
 
 	// The guest only needs the WASI ABI; do not pass the host environment,
 	// filesystem, stdin, or stdout through to a signing process.
@@ -43,10 +49,14 @@ func NewWasmCrypto() (*WasmCrypto, error) {
 
 	module, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
+		closeRuntime()
 		return nil, fmt.Errorf("compile wasm crypto module: %w", err)
 	}
+	defer module.Close()
+
 	instance, err := linker.Instantiate(store, module)
 	if err != nil {
+		closeRuntime()
 		return nil, fmt.Errorf("instantiate wasm crypto module: %w", err)
 	}
 
@@ -56,6 +66,34 @@ func NewWasmCrypto() (*WasmCrypto, error) {
 		linker:   linker,
 		instance: instance,
 	}, nil
+}
+
+// Close immediately releases Wasmtime's native linker, store, and engine
+// allocations. It is safe to call more than once. The signer must not be used
+// after Close returns.
+func (c *WasmCrypto) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	c.instance = nil
+
+	if c.linker != nil {
+		c.linker.Close()
+		c.linker = nil
+	}
+	if c.store != nil {
+		c.store.Close()
+		c.store = nil
+	}
+	if c.engine != nil {
+		c.engine.Close()
+		c.engine = nil
+	}
+	return nil
 }
 
 // SignSecp256k1 signs a 32-byte prehash. Recoverable signatures are encoded
@@ -192,6 +230,9 @@ func (c *WasmCrypto) invoke(
 }
 
 func (c *WasmCrypto) exports(functionName string) (*wasmtime.Memory, *wasmtime.Func, *wasmtime.Func, *wasmtime.Func, error) {
+	if c.closed || c.instance == nil || c.store == nil {
+		return nil, nil, nil, nil, fmt.Errorf("wasm crypto signer is closed")
+	}
 	memoryExport := c.instance.GetExport(c.store, "memory")
 	if memoryExport == nil || memoryExport.Memory() == nil {
 		return nil, nil, nil, nil, fmt.Errorf("wasm crypto module does not export memory")
